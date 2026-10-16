@@ -36,6 +36,10 @@ def parse_arguments():
                         help='If set, perform a dry run training with a mini-batch for sanity check.')
     parser.add_argument('--save_ckpt_every', type=int, default=500,
                         help='Save checkpoints every N steps. Default is 500.')
+    parser.add_argument('--pretraining_ckpt', type=str, default=None,
+                        help="Pretraining chkpt - set to non-strict, to allow basic fine tuning.")
+    parser.add_argument('--nll_weight', type=float, default=1e-1,
+                        help="Weight term for the NLL loss on keypoints (mean and cov).")
 
     args = parser.parse_args()
 
@@ -78,17 +82,25 @@ class Trainer():
                        model_name = 'xfeat_default',
                        batch_size = 10, n_steps = 160_000, lr= 3e-4, gamma_steplr=0.5, 
                        training_res = (800, 608), device_num="0", dry_run = False,
-                       save_ckpt_every = 500):
+                       save_ckpt_every = 500,
+                       nll_weight = 1e-1,
+                       pretraining_ckpt=None):
 
         self.dev = torch.device ('cuda' if torch.cuda.is_available() else 'cpu')
         self.net = IntensityFeatureModel().to(self.dev)
+        # Preload the pretrained checkpoint for 
+        if pretraining_ckpt is not None:
+            state = torch.load(pretraining_ckpt, map_location=self.dev)
+            self.net.load_state_dict(state, strict=False)
+            print(f"Loaded {pretraining_ckpt} pretrained weights")
+
 
         #Setup optimizer 
         self.batch_size = batch_size
         self.steps = n_steps
         self.opt = optim.Adam(filter(lambda x: x.requires_grad, self.net.parameters()) , lr = lr)
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.opt, step_size=30_000, gamma=gamma_steplr)
-        self.nll_weight = 1e-1
+        self.nll_weight = nll_weight
 
         ##################### Synthetic COCO INIT ##########################
         if model_name in ('xfeat_default', 'xfeat_synthetic', 'xfeat_intensity'):
@@ -314,7 +326,9 @@ if __name__ == '__main__':
         training_res=args.training_res,
         device_num=args.device_num,
         dry_run=args.dry_run,
-        save_ckpt_every=args.save_ckpt_every
+        save_ckpt_every=args.save_ckpt_every,
+        nll_weight=args.nll_weight,
+        pretraining_ckpt=args.pretraining_ckpt
     )
 
     #The most fun part
