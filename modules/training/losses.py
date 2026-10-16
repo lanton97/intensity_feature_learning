@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import math
 
 from modules.dataset.megadepth import megadepth_warper
 
@@ -72,7 +73,6 @@ def fine_loss(f1, f2, pts1, pts2, fine_module, ws=7):
 
 
 def alike_distill_loss(kpts, img):
-
     C, H, W = kpts.shape
     kpts = kpts.permute(1,2,0) 
     img = img.permute(1,2,0).expand(-1,-1,3).cpu().numpy() * 255
@@ -106,6 +106,60 @@ def alike_distill_loss(kpts, img):
     loss = F.nll_loss(kpts, labels, reduction = 'mean')
 
     return loss, acc
+
+def alike_distill_loss_with_conf(kpts, mu, L, img):
+    '''
+        kpts: (65, Hc, Wc) logits, mu: (Hc, Wc, 2) in [0,8], L: (Hc, Wc, 2, 2)
+        Returns: cls loss, cls acc, gaussian NLL, mean err (px), mean std (px)
+    '''
+    C, H, W = kpts.shape
+    kpts = kpts.permute(1,2,0)
+    img = img.permute(1,2,0).expand(-1,-1,3).cpu().numpy() * 255
+
+    with torch.no_grad():
+        alike_kpts = torch.tensor(extract_alike_kpts(img), device=kpts.device, dtype=torch.float32)
+        cell = (alike_kpts / 8).long()
+        cell_idx = cell[:, 1] * W + cell[:, 0]
+
+        # Keep one kpt per cell so the class label and continuous target agree
+        order = torch.argsort(cell_idx, stable=True)
+        cs = cell_idx[order]
+        keep = torch.ones_like(cs, dtype=torch.bool)
+        keep[1:] = cs[1:] != cs[:-1]
+        sel = order[keep]
+        alike_kpts, cell_idx = alike_kpts[sel], cell_idx[sel]
+
+        offsets = alike_kpts - 8 * torch.floor(alike_kpts / 8)   # (M,2) continuous, [0,8)
+        bins = offsets.long().clamp(0, 7)
+        labels = torch.full((H * W,), 64, dtype=torch.long, device=kpts.device)
+        labels[cell_idx] = bins[:, 0] + 8 * bins[:, 1]
+
+    kpts = kpts.reshape(-1, C)
+
+    mask = labels < 64
+    idxs_pos = mask.nonzero().flatten()
+    idxs_neg = (~mask).nonzero().flatten()
+    perm = torch.randperm(idxs_neg.size(0))[:len(idxs_pos)//32]
+    idxs = torch.cat([idxs_pos, idxs_neg[perm]])
+
+    kpts_sel = kpts[idxs]
+    labels_sel = labels[idxs]
+
+    with torch.no_grad():
+        acc = (kpts_sel.max(dim=-1)[1] == labels_sel).float().mean()
+
+    loss = F.nll_loss(F.log_softmax(kpts_sel, dim=-1), labels_sel)
+
+    # Gaussian NLL on cells that contain a keypoint only
+    mu_pos = mu.reshape(-1, 2)[cell_idx]
+    L_pos = L.reshape(-1, 2, 2)[cell_idx]
+    nll = gaussian_nll_2d(mu_pos, L_pos, offsets)
+
+    with torch.no_grad():
+        err_px = (mu_pos - offsets).norm(dim=-1).mean()
+        std_px = (L_pos[:, 0, 0] * L_pos[:, 1, 1]).sqrt().mean()   # det(Σ)^(1/4)
+
+    return loss, acc, nll, err_px, std_px
 
 
 def keypoint_position_loss(kpts1, kpts2, pts1, pts2, softmax_temp = 1.0):
@@ -222,3 +276,14 @@ def hard_triplet_loss(X,Y, margin = 0.5):
     loss = torch.clamp(margin + dist_pos - hard_neg, min=0.)
 
     return loss.mean()
+
+
+def gaussian_nll_2d(mu, L, target):
+    '''
+        Full-covariance 2D Gaussian NLL. mu, target: (..., 2); L: (..., 2, 2) lower-triangular, Σ = L Lᵀ
+    '''
+    diff = (target - mu).unsqueeze(-1)                                     # (..., 2, 1)
+    z = torch.linalg.solve_triangular(L, diff, upper=False).squeeze(-1)    # L z = diff
+    maha = (z ** 2).sum(-1)                                                # rᵀ Σ⁻¹ r
+    log_det = 2 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)   # log|Σ|
+    return (0.5 * (maha + log_det) + math.log(2 * math.pi)).mean()
