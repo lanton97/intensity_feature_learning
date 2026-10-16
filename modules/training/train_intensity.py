@@ -40,6 +40,7 @@ def parse_arguments():
                         help="Pretraining chkpt - set to non-strict, to allow basic fine tuning.")
     parser.add_argument('--nll_weight', type=float, default=1e-1,
                         help="Weight term for the NLL loss on keypoints (mean and cov).")
+    parser.add_argument('--freeze_backbone', action='store_true', help='Freeze pretrained layers for only fine tuning.')
 
     args = parser.parse_args()
 
@@ -84,15 +85,29 @@ class Trainer():
                        training_res = (800, 608), device_num="0", dry_run = False,
                        save_ckpt_every = 500,
                        nll_weight = 1e-1,
-                       pretraining_ckpt=None):
+                       pretraining_ckpt=None,
+                       freeze_backbone=False):
 
         self.dev = torch.device ('cuda' if torch.cuda.is_available() else 'cpu')
         self.net = IntensityFeatureModel().to(self.dev)
+        self.freeze_backbone = freeze_backbone
         # Preload the pretrained checkpoint for 
         if pretraining_ckpt is not None:
             state = torch.load(pretraining_ckpt, map_location=self.dev)
             self.net.load_state_dict(state, strict=False)
             print(f"Loaded {pretraining_ckpt} pretrained weights")
+
+        # TODO: Try different methods for fine tuning
+        if freeze_backbone:
+            print('Freezing CNN backbone, training only output heads')
+            for param in self.net.parameters():
+                param.requires_grad = False
+
+            for param in self.net.mu_head.parameters():
+                param.requires_grad=True
+            
+            for param in self.net.cholesky_head.parameters():
+                param.requires_grad=True
 
 
         #Setup optimizer 
@@ -155,6 +170,10 @@ class Trainer():
     def train(self):
 
         self.net.train()
+        if self.freeze_backbone:
+            self.net.eval()
+            self.net.mu_head.train()
+            self.net.cholesky_head.train()
 
         difficulty = 0.10
 
@@ -329,7 +348,8 @@ if __name__ == '__main__':
         dry_run=args.dry_run,
         save_ckpt_every=args.save_ckpt_every,
         nll_weight=args.nll_weight,
-        pretraining_ckpt=args.pretraining_ckpt
+        pretraining_ckpt=args.pretraining_ckpt,
+        freeze_backbone=args.freeze_backbone
     )
 
     #The most fun part
