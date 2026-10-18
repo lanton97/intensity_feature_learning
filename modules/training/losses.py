@@ -6,7 +6,7 @@ from modules.dataset.megadepth import megadepth_warper
 
 from modules.training import utils
 
-from third_party.alike_wrapper import extract_alike_kpts
+from third_party.alike_wrapper import extract_alike_kpts, extract_alike_kpts_scores, detectAndCompute
 
 def dual_softmax_loss(X, Y, temp = 0.2):
     if X.size() != Y.size() or X.dim() != 2 or Y.dim() != 2:
@@ -107,7 +107,7 @@ def alike_distill_loss(kpts, img):
 
     return loss, acc
 
-def alike_distill_loss_with_conf(kpts, mu, L, img):
+def alike_distill_loss_with_conf(kpts, mu, L, img, top_k=512, min_score=0.4):
     '''
         kpts: (65, Hc, Wc) logits, mu: (Hc, Wc, 2) in [0,8], L: (Hc, Wc, 2, 2)
         Returns: cls loss, cls acc, gaussian NLL, mean err (px), mean std (px)
@@ -117,7 +117,12 @@ def alike_distill_loss_with_conf(kpts, mu, L, img):
     img = img.permute(1,2,0).expand(-1,-1,3).cpu().numpy() * 255
 
     with torch.no_grad():
-        alike_kpts = torch.tensor(extract_alike_kpts(img), device=kpts.device, dtype=torch.float32)
+        alike_kpts, alike_scores, _ = detectAndCompute(img[None].expand(-1, 3, -1, -1))   # img_t: (1,H,W) in [0,1]
+        keep = alike_scores >= min_score
+        alike_kpts, alike_scores = alike_kpts[keep], alike_scores[keep]
+        alike_kpts = alike_kpts[torch.argsort(-alike_scores)[:top_k]].to(kpts.device)
+
+        
         cell = (alike_kpts / 8).long()
         cell_idx = cell[:, 1] * W + cell[:, 0]
 
