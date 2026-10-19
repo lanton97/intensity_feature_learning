@@ -45,6 +45,12 @@ def parse_arguments():
                         help="Minimum score on range [0,1] for alike keypoints.")
     parser.add_argument('--alike_top_k', type=int, default=512,
                         help="Top K alike keypoints to select.")
+    parser.add_argument('--kp_neg_ratio', type=float, default=1/32,
+                        help="Dustbin (non-keypoint) cells sampled per ALIKE keypoint cell in the detection loss. "
+                             "XFeat default 1/32 suits dense COCO; use ~1.0 for filtered lidar keypoints.")
+    parser.add_argument('--kp_edge_margin', type=int, default=0,
+                        help="Drop ALIKE keypoints within N px of a lidar no-return pixel (sky / rig mask edges). "
+                             "0 = off (COCO); 2 for lidar.")
 
     args = parser.parse_args()
 
@@ -92,13 +98,17 @@ class Trainer():
                        pretraining_ckpt=None,
                        freeze_backbone=False,
                        alike_top_k=512,
-                       alike_min_score=0.0):
+                       alike_min_score=0.0,
+                       kp_neg_ratio=1/32,
+                       kp_edge_margin=0):
 
         self.dev = torch.device ('cuda' if torch.cuda.is_available() else 'cpu')
         self.net = IntensityFeatureModel().to(self.dev)
         self.freeze_backbone = freeze_backbone
         self.alike_top_k= alike_top_k
         self.alike_min_score = alike_min_score
+        self.kp_neg_ratio = kp_neg_ratio
+        self.kp_edge_margin = kp_edge_margin
         # Preload the pretrained checkpoint for 
         if pretraining_ckpt is not None:
             state = torch.load(pretraining_ckpt, map_location=self.dev)
@@ -134,7 +144,7 @@ class Trainer():
                                         out_resolution = training_res, 
                                         warp_resolution = training_res,
                                         sides_crop = 0.1,
-                                        max_num_imgs = 3_000,
+                                        max_num_imgs = 10000,
                                         num_test_imgs = 5,
                                         photometric = True,
                                         geometric = True,
@@ -293,8 +303,8 @@ class Trainer():
                     loss_ds, conf = dual_softmax_loss(m1, m2)
                     loss_coords, acc_coords = coordinate_classification_loss(coords1, pts1, pts2, conf)
 
-                    loss_kp_pos1, acc_pos1, nll1, err1, std1 = alike_distill_loss_with_conf(kpts1[b], mu1[b], L1[b], p1[b], top_k=self.alike_top_k, min_score=self.alike_min_score)
-                    loss_kp_pos2, acc_pos2, nll2, err2, std2 = alike_distill_loss_with_conf(kpts2[b], mu2[b], L2[b], p2[b], top_k=self.alike_top_k, min_score=self.alike_min_score)
+                    loss_kp_pos1, acc_pos1, nll1, err1, std1 = alike_distill_loss_with_conf(kpts1[b], mu1[b], L1[b], p1[b], top_k=self.alike_top_k, min_score=self.alike_min_score, neg_ratio=self.kp_neg_ratio, edge_margin=self.kp_edge_margin)
+                    loss_kp_pos2, acc_pos2, nll2, err2, std2 = alike_distill_loss_with_conf(kpts2[b], mu2[b], L2[b], p2[b], top_k=self.alike_top_k, min_score=self.alike_min_score, neg_ratio=self.kp_neg_ratio, edge_margin=self.kp_edge_margin)
                     loss_kp_pos = (loss_kp_pos1 + loss_kp_pos2) * 2.0
                     acc_pos = (acc_pos1 + acc_pos2) / 2
                     loss_nll = (nll1 + nll2) * self.nll_weight
@@ -371,7 +381,11 @@ if __name__ == '__main__':
         save_ckpt_every=args.save_ckpt_every,
         nll_weight=args.nll_weight,
         pretraining_ckpt=args.pretraining_ckpt,
-        freeze_backbone=args.freeze_backbone
+        freeze_backbone=args.freeze_backbone,
+        alike_top_k=args.alike_top_k,
+        alike_min_score=args.alike_min_score,
+        kp_neg_ratio=args.kp_neg_ratio,
+        kp_edge_margin=args.kp_edge_margin
     )
 
     #The most fun part

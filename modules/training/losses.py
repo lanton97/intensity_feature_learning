@@ -107,9 +107,12 @@ def alike_distill_loss(kpts, img):
 
     return loss, acc
 
-def alike_distill_loss_with_conf(kpts, mu, L, img, top_k=512, min_score=0.4):
+def alike_distill_loss_with_conf(kpts, mu, L, img, top_k=512, min_score=0.4, neg_ratio=1/32, edge_margin=0):
     '''
-        kpts: (65, Hc, Wc) logits, mu: (Hc, Wc, 2) in [0,8], L: (Hc, Wc, 2, 2)
+        kpts: (65, Hc, Wc) logits, mu: (Hc, Wc, 2) in [0,8], L: (Hc, Wc, 2, 2), img: (1, H, W) in [0,1]
+        edge_margin: drop teacher keypoints within this many px of a lidar no-return pixel (stored as
+                     1/255, see extract_lidar_images.py). They sit on the artificial return/no-return
+                     boundary (sky line, rig mask) rather than on scene structure. 0 = off (COCO).
         Returns: cls loss, cls acc, gaussian NLL, mean err (px), mean std (px)
     '''
     C, H, W = kpts.shape
@@ -117,9 +120,18 @@ def alike_distill_loss_with_conf(kpts, mu, L, img, top_k=512, min_score=0.4):
 
     with torch.no_grad():
         alike_kpts, alike_scores, _ = detectAndCompute(img[None].expand(-1, 3, -1, -1))
+        alike_kpts, alike_scores = alike_kpts.to(kpts.device), alike_scores.to(kpts.device)
         keep = alike_scores >= min_score
+
+        if edge_margin > 0 and len(alike_kpts):
+            invalid = (img[:1] <= 1.5 / 255).float()[None]                               # (1,1,H,W)
+            near_invalid = F.max_pool2d(invalid, 2 * edge_margin + 1, 1, edge_margin)[0, 0] > 0
+            xi = alike_kpts[:, 0].round().long().clamp(0, near_invalid.shape[1] - 1)
+            yi = alike_kpts[:, 1].round().long().clamp(0, near_invalid.shape[0] - 1)
+            keep &= ~near_invalid[yi, xi]
+
         alike_kpts, alike_scores = alike_kpts[keep], alike_scores[keep]
-        alike_kpts = alike_kpts[torch.argsort(-alike_scores)[:top_k]].to(kpts.device)
+        alike_kpts = alike_kpts[torch.argsort(-alike_scores)[:top_k]]
         if len(alike_kpts) == 0:
             with torch.enable_grad():
                 zero = mu.sum() * 0 + kpts.sum() * 0
@@ -148,7 +160,7 @@ def alike_distill_loss_with_conf(kpts, mu, L, img, top_k=512, min_score=0.4):
     mask = labels < 64
     idxs_pos = mask.nonzero().flatten()
     idxs_neg = (~mask).nonzero().flatten()
-    perm = torch.randperm(idxs_neg.size(0))[:len(idxs_pos)//32]
+    perm = torch.randperm(idxs_neg.size(0))[:int(len(idxs_pos) * neg_ratio)]
     idxs = torch.cat([idxs_pos, idxs_neg[perm]])
 
     kpts_sel = kpts[idxs]
