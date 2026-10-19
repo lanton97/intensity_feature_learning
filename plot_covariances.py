@@ -6,6 +6,11 @@
         python plot_covariances.py --img /home/asrl/datasets/coco/val2017/000000000139.jpg \
             --ckpt ckpts/cov_v0/xfeat_synthetic_5000.pth --n_show 200 --grid 32
 
+        # lidar panorama: run at the training resolution, skip no-return pixels
+        python plot_covariances.py --img /home/asrl/datasets/lidar/geode_beta/<frame>.png \
+            --ckpt ckpt/lidar_dry/lidar_synthetic_1500.pth --resize 1024,128 --edge_margin 2 \
+            --grid 16 --n_show 300 --std_map
+
         # zoom on a region, show the least certain keypoints, add the uncertainty map
         python plot_covariances.py --img img.png --ckpt model.pth --roi 100 50 300 200 \
             --select least_certain --n_show 30 --std_map
@@ -37,6 +42,18 @@ def parse_args():
     # Detection
     p.add_argument('--top_k', type=int, default=4096, help='Max keypoints detected before filtering.')
     p.add_argument('--min_score', type=float, default=0.05, help='Detection score threshold.')
+    p.add_argument('--resize', type=lambda s: tuple(map(int, s.split(','))), default=None, metavar='W,H',
+                   help='Run the network at this resolution (use the training res, e.g. 1024,128 for lidar). '
+                        'Default: original size rounded down to a multiple of 32.')
+    p.add_argument('--nms', type=int, default=0,
+                   help='Odd window (in 8px cells) for non-max suppression on the cell scores. 0 = off; each '
+                        'cell already yields at most one keypoint, so this only thins them out.')
+    p.add_argument('--drop_no_return', action='store_true',
+                   help='Drop keypoints that land on no-return pixels (value <= 1, see extract_lidar_images.py).')
+    p.add_argument('--edge_margin', type=int, default=0,
+                   help='Also drop keypoints within N px (at the network resolution, same units as the training '
+                        '--kp_edge_margin) of a no-return pixel, e.g. the sky line and the masked robot. Implies '
+                        '--drop_no_return.')
 
     # Subset filtering for legibility
     p.add_argument('--roi', type=float, nargs=4, metavar=('X0', 'Y0', 'X1', 'Y1'), default=None,
@@ -68,14 +85,15 @@ def load_model(ckpt, base_weights, dev):
 
 
 @torch.inference_mode()
-def detect_with_cov(net, img, dev, top_k, min_score):
+def detect_with_cov(net, img, dev, top_k, min_score, resize=None, nms=0, drop_no_return=False, edge_margin=0):
     """
         img: (H, W) uint8 grayscale.
         Returns keypoints (N,2), covariances (N,2,2), scores (N,) in original image px,
         and the per-cell uncertainty map det(Σ)^(1/4) at coarse (H/8, W/8) resolution.
     """
     H, W = img.shape
-    _H, _W = (H // 32) * 32, (W // 32) * 32
+    _W, _H = resize if resize is not None else (W, H)
+    _H, _W = (_H // 32) * 32, (_W // 32) * 32
     rh, rw = H / _H, W / _W
 
     x = torch.from_numpy(img).float().to(dev)[None, None] / 255.
@@ -84,7 +102,8 @@ def detect_with_cov(net, img, dev, top_k, min_score):
     _, logits, hmap, mu, L, cov = net(x)
 
     score = (1 - F.softmax(logits, 1)[:, 64]) * hmap[:, 0]                   # p(kpt in cell) * reliability
-    score = score * (score == F.max_pool2d(score[:, None], 3, 1, 1)[:, 0])   # coarse NMS
+    if nms > 1:
+        score = score * (score == F.max_pool2d(score[:, None], nms, 1, nms // 2)[:, 0])
     score = score[0]
     Hc, Wc = score.shape
 
@@ -99,7 +118,21 @@ def detect_with_cov(net, img, dev, top_k, min_score):
 
     std_map = (L[0, ..., 0, 0] * L[0, ..., 1, 1]).sqrt()
 
-    return kps.cpu().numpy(), covs.cpu().numpy(), s.cpu().numpy(), std_map.cpu().numpy()
+    if (drop_no_return or edge_margin > 0) and len(kps):
+        # Same test as training: no-return is stored as 1/255; check at the network resolution
+        invalid = (x[:, :1] <= 1.5 / 255).float()
+        if edge_margin > 0:
+            invalid = F.max_pool2d(invalid, 2 * edge_margin + 1, 1, edge_margin)
+        invalid = invalid[0, 0] > 0
+        k_net = kps / torch.tensor([rw, rh], device=dev)
+        xi = k_net[:, 0].round().long().clamp(0, _W - 1)
+        yi = k_net[:, 1].round().long().clamp(0, _H - 1)
+        keep = ~invalid[yi, xi]
+        kps, covs, s = kps[keep], covs[keep], s[keep]
+
+    kps, covs, s = kps.cpu().numpy(), covs.cpu().numpy(), s.cpu().numpy()
+
+    return kps, covs, s, std_map.cpu().numpy()
 
 
 def mean_std(covs):
@@ -149,8 +182,12 @@ def cov_to_ellipses(covs, n_sigma):
 
 def plot(img, kps, covs, scores, std_map, args):
     n_panels = 2 if args.std_map else 1
-    fig, axes = plt.subplots(1, n_panels, figsize=(9 * n_panels, 9 * img.shape[0] / img.shape[1]),
-                             squeeze=False)
+    aspect = img.shape[0] / img.shape[1]
+    if aspect < 0.33:   # wide panoramas (lidar): stack panels vertically, full width
+        fig, axes = plt.subplots(n_panels, 1, figsize=(20, n_panels * (20 * aspect + 1.2)), squeeze=False)
+        axes = axes.T
+    else:
+        fig, axes = plt.subplots(1, n_panels, figsize=(9 * n_panels, 9 * aspect), squeeze=False)
     ax = axes[0, 0]
     ax.imshow(img, cmap='gray', interpolation='nearest')
 
@@ -208,7 +245,8 @@ def main():
         raise FileNotFoundError(args.img)
 
     net = load_model(args.ckpt, args.base_weights, dev)
-    kps, covs, scores, std_map = detect_with_cov(net, img, dev, args.top_k, args.min_score)
+    kps, covs, scores, std_map = detect_with_cov(net, img, dev, args.top_k, args.min_score,
+                                                 args.resize, args.nms, args.drop_no_return, args.edge_margin)
     idx = filter_keypoints(kps, covs, scores, args)
     print(f'detected {len(kps)} keypoints, drawing {len(idx)}')
 
