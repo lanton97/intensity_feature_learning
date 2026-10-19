@@ -52,12 +52,12 @@ def generateRandomTPS(shape, grid = (8, 6), GLOBAL_MULTIPLIER = 0.3, prob = 0.5)
     return src, weights, A
 
 
-def generateRandomHomography(shape, GLOBAL_MULTIPLIER = 0.3, max_rot=30):
+def generateRandomHomography(shape, GLOBAL_MULTIPLIER = 0.3, max_rot=30, scale_range=[0.35,1.2], shear_scale=1.0):
     #Generate random in-plane rotation [-theta,+theta]
     theta = np.radians(np.random.uniform(-max_rot, max_rot))
 
     #Generate random scale in both x and y
-    scale_x, scale_y = np.random.uniform(0.35, 1.2, 2)
+    scale_x, scale_y = np.random.uniform(scale_range[0], scale_range[1], 2)
 
     #Generate random translation shift
     tx , ty = -shape[1]/2.0 , -shape[0]/2.0 
@@ -66,7 +66,7 @@ def generateRandomHomography(shape, GLOBAL_MULTIPLIER = 0.3, max_rot=30):
     c, s = np.cos(theta), np.sin(theta)
 
     #Affine coeffs
-    sx , sy = np.random.normal(0,0.6*GLOBAL_MULTIPLIER,2)
+    sx , sy = np.random.normal(0,shear_scale * 0.6*GLOBAL_MULTIPLIER,2)
 
     #Projective coeffs
     p1 , p2 = np.random.normal(0,0.006*GLOBAL_MULTIPLIER,2)
@@ -344,7 +344,7 @@ class LidarAugmentationPipe(AugmentationPipe):
 
         list_augmentation = [
                         kornia.augmentation.RandomEqualize(p = 0.4),
-                        kornia.augmentation.RandomGaussianBlur(p = 0.3, sigma = (2.0, 2.0), kernel_size = (7,7))
+                        kornia.augmentation.RandomGaussianBlur((3, 3), (0.5, 1.0), p=0.2)
                         ]
         if photometric is False:
             list_augmentation = []
@@ -377,7 +377,7 @@ class LidarAugmentationPipe(AugmentationPipe):
     @torch.inference_mode()
     def forward(self, x, difficulty = 0.3, TPS = False, prob_deformation = 0.5, test = False, max_rot=0):
         """
-            Perform augmentation to a batch of images.
+            Perform augmentation to a batch of Lidar intensity/reflectivity images.
 
             input:
                 x -> torch.Tensor(B, C, H, W): rgb images
@@ -408,7 +408,7 @@ class LidarAugmentationPipe(AugmentationPipe):
               
             ######## Geometric Transformations
 
-            H = torch.tensor(np.array([generateRandomHomography(shape, difficulty, max_rot) for b in range(self.batch_size)]),
+            H = torch.tensor(np.array([generateRandomHomography(shape, difficulty, max_rot, scale_range=[0.8,1.2], shear_scale=0.5) for b in range(self.batch_size)]),
                                dtype = torch.float32).to(self.device)
             
             output = kornia.geometry.transform.warp_perspective(x, H,
@@ -448,6 +448,9 @@ class LidarAugmentationPipe(AugmentationPipe):
             output[~mask] = output_shifted[~mask]
             mask = mask[:, 0, :, :]
 
+            valid = output > (1.5 / 255)
+            mask = mask & valid[:, 0]
+
             ######## Photometric Transformations
             output = self.aug_list(output)
 
@@ -458,14 +461,7 @@ class LidarAugmentationPipe(AugmentationPipe):
                 noise = F.interpolate(noise, (h, w), mode = 'bicubic')
                 output = torch.clip( output + noise, 0., 1.)
 
-            #Random shadows
-            if np.random.uniform() > 0.6 and self.photometric:
-                noise = torch.rand((b, 1, h//64, w//64), device = self.device) * 1.3
-                noise = torch.clip(noise, 0.25, 1.0)
-                noise = F.interpolate(noise, (h, w), mode = 'bicubic')
-                noise = noise.expand(-1, c, -1, -1)
-                output *= noise
-                output = torch.clip( output, 0., 1.)
+            output = torch.where(valid, output, torch.full_like(output, 1 / 255))
 
             self.cnt+=1
 
