@@ -18,7 +18,7 @@ def parse_arguments():
     parser.add_argument('--ckpt_save_path', type=str, required=True,
                         help='Path to save the checkpoints.')
     parser.add_argument('--training_type', type=str, default='xfeat_default',
-                        choices=['xfeat_default', 'xfeat_synthetic', 'xfeat_megadepth'],
+                        choices=['xfeat_default', 'xfeat_synthetic', 'xfeat_megadepth', 'lidar_synthetic'],
                         help='Training scheme. xfeat_default uses both megadepth & synthetic warps.')
     parser.add_argument('--batch_size', type=int, default=10,
                         help='Batch size for training. Default is 10.')
@@ -41,6 +41,10 @@ def parse_arguments():
     parser.add_argument('--nll_weight', type=float, default=1e-1,
                         help="Weight term for the NLL loss on keypoints (mean and cov).")
     parser.add_argument('--freeze_backbone', action='store_true', help='Freeze pretrained layers for only fine tuning.')
+    parser.add_argument('--alike_min_score', type=float, default=0.5,
+                        help="Minimum score on range [0,1] for alike keypoints.")
+    parser.add_argument('--alike_top_k', type=int, default=512,
+                        help="Top K alike keypoints to select.")
 
     args = parser.parse_args()
 
@@ -86,11 +90,15 @@ class Trainer():
                        save_ckpt_every = 500,
                        nll_weight = 1e-1,
                        pretraining_ckpt=None,
-                       freeze_backbone=False):
+                       freeze_backbone=False,
+                       alike_top_k=512,
+                       alike_min_score=0.0):
 
         self.dev = torch.device ('cuda' if torch.cuda.is_available() else 'cpu')
         self.net = IntensityFeatureModel().to(self.dev)
         self.freeze_backbone = freeze_backbone
+        self.alike_top_k= alike_top_k
+        self.alike_min_score = alike_min_score
         # Preload the pretrained checkpoint for 
         if pretraining_ckpt is not None:
             state = torch.load(pretraining_ckpt, map_location=self.dev)
@@ -120,6 +128,20 @@ class Trainer():
         ##################### Synthetic COCO INIT ##########################
         if model_name in ('xfeat_default', 'xfeat_synthetic', 'xfeat_intensity'):
             self.augmentor = AugmentationPipe(
+                                        img_dir = synthetic_root_path,
+                                        device = self.dev, load_dataset = True,
+                                        batch_size = int(self.batch_size * 0.4 if model_name=='xfeat_default' else batch_size),
+                                        out_resolution = training_res, 
+                                        warp_resolution = training_res,
+                                        sides_crop = 0.1,
+                                        max_num_imgs = 3_000,
+                                        num_test_imgs = 5,
+                                        photometric = True,
+                                        geometric = True,
+                                        reload_step = 4_000
+                                        )
+        elif model_name == "lidar_synthetic":
+            self.augmentor = LidarAugmentationPipe(
                                         img_dir = synthetic_root_path,
                                         device = self.dev, load_dataset = True,
                                         batch_size = int(self.batch_size * 0.4 if model_name=='xfeat_default' else batch_size),
@@ -231,7 +253,7 @@ class Trainer():
                         p1 = torch.cat([p1s, p1], dim=0)
                         p2 = torch.cat([p2s, p2], dim=0)
                         positives_c = positives_s_coarse + positives_md_coarse
-                    elif self.model_name in ('xfeat_synthetic'):
+                    elif self.model_name in ('xfeat_synthetic', 'lidar_synthetic'):
                         p1 = p1s ; p2 = p2s
                         positives_c = positives_s_coarse
                     else:
@@ -271,8 +293,8 @@ class Trainer():
                     loss_ds, conf = dual_softmax_loss(m1, m2)
                     loss_coords, acc_coords = coordinate_classification_loss(coords1, pts1, pts2, conf)
 
-                    loss_kp_pos1, acc_pos1, nll1, err1, std1 = alike_distill_loss_with_conf(kpts1[b], mu1[b], L1[b], p1[b])
-                    loss_kp_pos2, acc_pos2, nll2, err2, std2 = alike_distill_loss_with_conf(kpts2[b], mu2[b], L2[b], p2[b])
+                    loss_kp_pos1, acc_pos1, nll1, err1, std1 = alike_distill_loss_with_conf(kpts1[b], mu1[b], L1[b], p1[b], top_k=self.alike_top_k, min_score=self.alike_min_score)
+                    loss_kp_pos2, acc_pos2, nll2, err2, std2 = alike_distill_loss_with_conf(kpts2[b], mu2[b], L2[b], p2[b], top_k=self.alike_top_k, min_score=self.alike_min_score)
                     loss_kp_pos = (loss_kp_pos1 + loss_kp_pos2) * 2.0
                     acc_pos = (acc_pos1 + acc_pos2) / 2
                     loss_nll = (nll1 + nll2) * self.nll_weight
