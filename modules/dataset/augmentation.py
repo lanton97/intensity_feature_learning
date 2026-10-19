@@ -36,8 +36,9 @@ def generateRandomTPS(shape, grid = (8, 6), GLOBAL_MULTIPLIER = 0.3, prob = 0.5)
 
     h, w = shape
     sh, sw = h/grid[0], w/grid[1]
-    src = torch.dstack(torch.meshgrid(torch.arange(0, h + sh , sh),
-                         torch.arange(0, w + sw , sw), indexing='ij'))
+    src = torch.dstack(torch.meshgrid(torch.linspace(0, h, grid[0] + 1),
+                                  torch.linspace(0, w, grid[1] + 1), indexing='ij'))
+
 
     offsets = torch.rand(grid[0]+1, grid[1]+1, 2) - 0.5
     offsets *= torch.tensor([ sh/2, sw/2 ]).view(1, 1, 2)  * min(0.97, 2.0 * GLOBAL_MULTIPLIER)
@@ -51,9 +52,9 @@ def generateRandomTPS(shape, grid = (8, 6), GLOBAL_MULTIPLIER = 0.3, prob = 0.5)
     return src, weights, A
 
 
-def generateRandomHomography(shape, GLOBAL_MULTIPLIER = 0.3):
+def generateRandomHomography(shape, GLOBAL_MULTIPLIER = 0.3, max_rot=30):
     #Generate random in-plane rotation [-theta,+theta]
-    theta = np.radians(np.random.uniform(-30, 30))
+    theta = np.radians(np.random.uniform(-max_rot, max_rot))
 
     #Generate random scale in both x and y
     scale_x, scale_y = np.random.uniform(0.35, 1.2, 2)
@@ -204,7 +205,7 @@ class AugmentationPipe(nn.Module):
       return (warped - offset) / scale
 
     @torch.inference_mode()
-    def forward(self, x, difficulty = 0.3, TPS = False, prob_deformation = 0.5, test = False):
+    def forward(self, x, difficulty = 0.3, TPS = False, prob_deformation = 0.5, test = False,c=3, max_rot=30):
         """
             Perform augmentation to a batch of images.
 
@@ -237,7 +238,7 @@ class AugmentationPipe(nn.Module):
               
             ######## Geometric Transformations
 
-            H = torch.tensor(np.array([generateRandomHomography(shape, difficulty) for b in range(self.batch_size)]),
+            H = torch.tensor(np.array([generateRandomHomography(shape, difficulty, max_rot) for b in range(self.batch_size)]),
                                dtype = torch.float32).to(self.device)
             
             output = kornia.geometry.transform.warp_perspective(x, H,
@@ -269,7 +270,7 @@ class AugmentationPipe(nn.Module):
             x = F.interpolate(x, self.out_resolution[::-1], mode = 'nearest')
 
             mask = ~torch.all(output == 0, dim=1, keepdim=True)
-            mask = mask.expand(-1,3,-1,-1)
+            mask = mask.expand(-1,c,-1,-1)
 
             # Make-up invalid regions with texture from the batch
             rv = 1 if not TPS else 2
@@ -312,3 +313,163 @@ class AugmentationPipe(nn.Module):
         warped_to_src = self.warp_points(H@torch.inverse(H2), undeformed)
 
         return warped_to_src
+
+class LidarAugmentationPipe(AugmentationPipe):
+    def __init__(
+                self, device, load_dataset = True,
+                img_dir = "/homeLocal/guipotje/sshfs/datasets/coco_20k",
+                warp_resolution = (1200, 900),
+                out_resolution = (400, 300),
+                sides_crop = 0.2,
+                max_num_imgs = 50,
+                num_test_imgs = 10,
+                batch_size = 1,
+                photometric = True,
+                geometric = True,
+                reload_step = 1_000
+                ):
+        super(LidarAugmentationPipe, self).__init__( 
+                device, load_dataset,
+                img_dir,
+                warp_resolution,
+                out_resolution,
+                sides_crop,
+                max_num_imgs,
+                num_test_imgs,
+                batch_size,
+                photometric,
+                geometric,
+                reload_step
+        )
+
+        list_augmentation = [
+                        kornia.augmentation.RandomEqualize(p = 0.4),
+                        kornia.augmentation.RandomGaussianBlur(p = 0.3, sigma = (2.0, 2.0), kernel_size = (7,7))
+                        ]
+        if photometric is False:
+            list_augmentation = []
+
+        self.aug_list = kornia.augmentation.ImageSequential(*list_augmentation)
+
+    def load_imgs(self):
+            random.shuffle(self.all_imgs)
+
+            train = []
+            fast = cv2.FastFeatureDetector_create(30)
+            for p in tqdm.tqdm(self.all_imgs[:self.max_num_imgs], desc='loading train'):
+                # Override the image read type
+                im = cv2.imread(p, cv2.IMREAD_GRAYSCALE)[..., None]
+                halfH, halfW = im.shape[0]//2, im.shape[1]//2
+
+                if im.shape[0] != self.dims[1] or im.shape[1] != self.dims[0]:
+                    im = cv2.resize(im, self.dims, interpolation=cv2.INTER_LINEAR)
+
+                train.append(np.copy(im[..., None]))
+
+            self.train = train
+            
+            self.test = [
+                        cv2.resize(cv2.imread(p, cv2.IMREAD_GRAYSCALE), self.dims, interpolation=cv2.INTER_LINEAR)[...,None] 
+                        for p in tqdm.tqdm(self.all_imgs[-self.num_test_imgs:],
+                                           desc='loading test')
+                        ] 
+
+    @torch.inference_mode()
+    def forward(self, x, difficulty = 0.3, TPS = False, prob_deformation = 0.5, test = False, max_rot=0):
+        """
+            Perform augmentation to a batch of images.
+
+            input:
+                x -> torch.Tensor(B, C, H, W): rgb images
+                difficulty -> float: level of difficulty, 0.1 is medium, 0.3 is already pretty hard
+                tps -> bool: Wether to apply non-rigid deformations in images
+                prob_deformation -> float: probability to apply a deformation
+
+            return:
+                'output'    ->   torch.Tensor(B, C, H, W): rgb images
+                Tuple:
+                    'H'       ->   torch.Tensor(3,3): homography matrix 
+                    'mask'  ->     torch.Tensor(B, H, W): mask of valid pixels after warp
+                    (deformation only)
+                    src, weights, A are parameters from a TPS warp (all torch.Tensors)
+
+        """
+
+        if self.cnt % self.reload_step == 0:
+            self.load_imgs()
+
+        if self.geometric is False:
+            difficulty = 0.
+
+        with torch.no_grad():
+            x = (x/255.).to(self.device)
+            b, c, h, w = x.shape
+            shape = (h, w)
+              
+            ######## Geometric Transformations
+
+            H = torch.tensor(np.array([generateRandomHomography(shape, difficulty, max_rot) for b in range(self.batch_size)]),
+                               dtype = torch.float32).to(self.device)
+            
+            output = kornia.geometry.transform.warp_perspective(x, H,
+                            dsize = shape, padding_mode = 'zeros')
+
+            #crop % of image boundaries each side to reduce invalid pixels after warps
+            low_h = int(h * self.sides_crop); low_w = int(w*self.sides_crop)
+            high_h = int(h*(1. - self.sides_crop)); high_w= int(w * (1. - self.sides_crop))
+            output = output[..., low_h:high_h, low_w:high_w]
+            x = x[..., low_h:high_h, low_w:high_w]
+
+            #apply TPS if desired:
+            if TPS:
+                src, weights, A = None, None, None
+                for b in range(self.batch_size):
+                    b_src, b_weights, b_A = generateRandomTPS(shape, (8,6), difficulty, prob = prob_deformation)
+                    b_src, b_weights, b_A = b_src.to(self.device), b_weights.to(self.device), b_A.to(self.device)
+
+                    if src is None:
+                        src, weights, A = b_src, b_weights, b_A
+                    else:
+                        src = torch.cat((b_src, src))
+                        weights = torch.cat((b_weights, weights))
+                        A = torch.cat((b_A, A))
+
+                output = warp_image_tps(output, src, weights, A)
+
+            output = F.interpolate(output, self.out_resolution[::-1], mode = 'bilinear')
+            x = F.interpolate(x, self.out_resolution[::-1], mode = 'bilinear')
+
+            mask = ~torch.all(output <= 1e-3, dim=1, keepdim=True)
+            mask = mask.expand(-1,c,-1,-1)
+
+            # Make-up invalid regions with texture from the batch
+            rv = 1 if not TPS else 2
+            output_shifted = torch.roll(x, rv, 0)
+            output[~mask] = output_shifted[~mask]
+            mask = mask[:, 0, :, :]
+
+            ######## Photometric Transformations
+            output = self.aug_list(output)
+
+            b, c, h, w = output.shape
+            #Correlated Gaussian Noise
+            if np.random.uniform() > 0.5 and self.photometric:
+                noise = F.interpolate(torch.randn_like(output)*(10/255), (h//2, w//2))
+                noise = F.interpolate(noise, (h, w), mode = 'bicubic')
+                output = torch.clip( output + noise, 0., 1.)
+
+            #Random shadows
+            if np.random.uniform() > 0.6 and self.photometric:
+                noise = torch.rand((b, 1, h//64, w//64), device = self.device) * 1.3
+                noise = torch.clip(noise, 0.25, 1.0)
+                noise = F.interpolate(noise, (h, w), mode = 'bicubic')
+                noise = noise.expand(-1, c, -1, -1)
+                output *= noise
+                output = torch.clip( output, 0., 1.)
+
+            self.cnt+=1
+
+        if TPS:
+            return output, (H, src, weights, A, mask)
+        else:
+            return output, (H, mask)
