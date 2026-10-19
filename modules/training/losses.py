@@ -114,13 +114,17 @@ def alike_distill_loss_with_conf(kpts, mu, L, img, top_k=512, min_score=0.4):
     '''
     C, H, W = kpts.shape
     kpts = kpts.permute(1,2,0)
-    img = img.permute(1,2,0).expand(-1,-1,3).cpu().numpy() * 255
 
     with torch.no_grad():
-        alike_kpts, alike_scores, _ = detectAndCompute(img[None].expand(-1, 3, -1, -1))   # img_t: (1,H,W) in [0,1]
+        alike_kpts, alike_scores, _ = detectAndCompute(img[None].expand(-1, 3, -1, -1))
         keep = alike_scores >= min_score
         alike_kpts, alike_scores = alike_kpts[keep], alike_scores[keep]
         alike_kpts = alike_kpts[torch.argsort(-alike_scores)[:top_k]].to(kpts.device)
+        if len(alike_kpts) == 0:
+            with torch.enable_grad():
+                zero = mu.sum() * 0 + kpts.sum() * 0
+            return zero, zero.detach(), zero, zero.detach(), zero.detach()
+
 
         
         cell = (alike_kpts / 8).long()
